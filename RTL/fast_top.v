@@ -2,8 +2,8 @@
 // fast_top.v
 // Top-level FAST-9 Hardware Accelerator (Cyclone II / DE2):
 //   SRAM Frame Buffer -> Line Buffer 7x7 -> FAST-9 Detector -> SAD Score
-//   -> Sparse NMS 3x3 (634x474) -> Grid 10x8 Top-K Filter -> Result Packer (3x16b)
-//   -> Result FIFO (scfifo) -> Avalon-MM Master DMA Write (SDRAM).
+//   -> Sparse NMS 3x3 (634x474) -> FIFO 128x29b -> Grid 10x8 Top-4 Filter
+//   -> Result Packer (3x16b) -> Result FIFO (scfifo) -> Avalon-MM DMA Write.
 // ============================================================================
 module fast_top #(
     parameter integer K_PER_CELL    = 4,    // Top-K moi o 64x64 (4 -> max 320 KP)
@@ -417,7 +417,41 @@ module fast_top #(
     );
 
     // ========================================================================
-    // 6. Keypoint Filter (Grid 10x8 tren 640x480, Top-K moi o)
+    // 6. FIFO trung gian 128 x 29-bit (NMS -> Keypoint Filter, 1 khoi M4K)
+    // ========================================================================
+    wire        nms_fifo_wrreq = nms_kp_valid || nms_flush_done;
+    wire [28:0] nms_fifo_din = nms_flush_done ? 29'h1000_0000
+                                          : {1'b0, nms_kp_valid, nms_kp_score, nms_kp_y, nms_kp_x};
+    wire [28:0] nms_fifo_dout;
+    wire        nms_fifo_empty;
+    wire        nms_fifo_full;
+    wire        kp_in_ready;
+    wire        nms_fifo_rdreq = (!nms_fifo_empty) && kp_in_ready;
+
+    scfifo #(
+        .intended_device_family ("Cyclone II"),
+        .lpm_numwords           (128),
+        .lpm_showahead          ("ON"),
+        .lpm_type               ("scfifo"),
+        .lpm_width              (29),
+        .lpm_widthu             (7),
+        .overflow_checking      ("ON"),
+        .underflow_checking     ("ON"),
+        .use_eab                ("ON")
+    ) u_nms_kp_fifo (
+        .clock (clk),
+        .sclr  (rst_h | frame_start),
+        .data  (nms_fifo_din),
+        .wrreq (nms_fifo_wrreq),
+        .rdreq (nms_fifo_rdreq),
+        .q     (nms_fifo_dout),
+        .empty (nms_fifo_empty),
+        .full  (nms_fifo_full),
+        .usedw ()
+    );
+
+    // ========================================================================
+    // 7. Keypoint Filter (Grid 10x8 tren 640x480, Top-4 moi o, M4K RAM)
     // ========================================================================
     wire       filt_out_valid;
     wire [9:0] filt_out_x;
@@ -428,18 +462,17 @@ module fast_top #(
     wire       res_fifo_full;
 
     keypoint_filter #(
-        .BORDER     (3),
-        .K_PER_CELL (K_PER_CELL),
         .OUT_CNT_W  (OUT_CNT_W)
     ) u_kp_filter (
         .clk         (clk),
         .rst_n       (rst_n),
         .start       (frame_start),
-        .in_valid    (nms_kp_valid),
-        .in_x        (nms_kp_x),
-        .in_y        (nms_kp_y),
-        .in_score    (nms_kp_score),
-        .nms_done    (nms_flush_done),
+        .in_valid    (!nms_fifo_empty && nms_fifo_dout[27]),
+        .in_x        (nms_fifo_dout[9:0]),
+        .in_y        (nms_fifo_dout[18:10]),
+        .in_score    (nms_fifo_dout[26:19]),
+        .nms_done    (!nms_fifo_empty && nms_fifo_dout[28]),
+        .in_ready    (kp_in_ready),
         .packer_busy (packer_busy),
         .fifo_full   (res_fifo_full),
         .out_valid   (filt_out_valid),
@@ -451,7 +484,7 @@ module fast_top #(
     );
 
     // ========================================================================
-    // 7. Result Packer (3x16b) + Result FIFO + Avalon-MM DMA Write
+    // 8. Result Packer (3x16b) + Result FIFO + Avalon-MM DMA Write
     // ========================================================================
     wire [15:0] res_fifo_wdata;
     wire        res_fifo_wr;

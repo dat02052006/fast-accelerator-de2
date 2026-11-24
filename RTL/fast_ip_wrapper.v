@@ -1,10 +1,19 @@
 // ============================================================================
 // fast_ip_wrapper.v
-// Qsys Top-Level Wrapper cho FAST-9 Accelerator IP Core.
+// Qsys Top-Level Wrapper cho FAST-9 Hardware Accelerator IP Core (Cyclone II).
+//
+// Cau hinh Interfaces trong Qsys Component Editor:
+//   1. clock            : Clock Input (clk)
+//   2. reset            : Reset Input (rst_n, Active Low)
+//   3. avs_csr          : Avalon-MM Slave (32-bit, Read Latency = 1, Write Latency = 0)
+//   4. avs_mem          : Avalon-MM Slave (16-bit, use waitrequest = avs_mem_waitrequest)
+//   5. avs_ctrl         : Avalon-MM Slave (16-bit, Read Latency = 1, Write Latency = 0)
+//   6. avm              : Avalon-MM Master (16-bit, Address Units = Symbols/Bytes)
+//   7. interrupt_sender : Interrupt Sender (irq, Associated Addressable Point = avs_csr)
+//   8. sram_conduit     : Conduit End (sram_addr, sram_dq, sram_ce_n, oe_n, we_n, ub_n, lb_n)
 // ============================================================================
 module fast_ip_wrapper #(
-    parameter integer K_PER_CELL    = 4,    // Top-K moi o 64x64
-    parameter integer OUT_CNT_W     = 12,   // Do rong bo dem so keypoint
+    parameter integer OUT_CNT_W     = 12,   // Do rong bo dem so keypoint (max 300)
     parameter integer DRAIN_CYC     = 16,   // So chu ky xa pipeline FAST/score
     parameter integer DMA_BURST_LEN = 1     // 1 cho Qsys SDR SDRAM controller
 )(
@@ -54,6 +63,10 @@ module fast_ip_wrapper #(
 
     localparam [31:0] IP_SIGNATURE = 32'hFA57_2026;
 
+    // ========================================================================
+    // Thanh ghi cau hinh & trang thai CSR
+    // ========================================================================
+    reg         start_cmd_d;
     reg         fast_start_pulse;
     reg         irq_en;
     reg  [31:0] dma_base_addr_reg;
@@ -72,32 +85,38 @@ module fast_ip_wrapper #(
     wire [OUT_CNT_W-1:0] out_count;
     wire [31:0]          words_written;
 
-    wire csr_wr_ctrl  = avs_csr_write && (avs_csr_address == 3'd0);
-    wire clear_sticky = csr_wr_ctrl && avs_csr_byteenable[0] && avs_csr_writedata[2];
-    wire start_cmd    = csr_wr_ctrl && avs_csr_byteenable[0] && avs_csr_writedata[0];
+    // Giai ma lenh ghi vao CSR[0] (CTRL)
+    wire csr_wr_ctrl  = avs_csr_write && (avs_csr_address == 3'd0) && avs_csr_byteenable[0];
+    wire start_cmd    = csr_wr_ctrl && avs_csr_writedata[0];
+    wire clear_sticky = csr_wr_ctrl && avs_csr_writedata[2];
+
+    // Bat suon len (Rising-Edge) tao xung khoi dong chuan 1 chu ky clock
+    wire start_edge   = start_cmd && !start_cmd_d;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            start_cmd_d       <= 1'b0;
             fast_start_pulse  <= 1'b0;
             irq_en            <= 1'b0;
             dma_base_addr_reg <= 32'h0000_0000;
             fast_thresh_reg   <= 8'd20;
         end else begin
-            fast_start_pulse <= start_cmd;
+            start_cmd_d      <= start_cmd;
+            fast_start_pulse <= start_edge;
 
             if (avs_csr_write) begin
                 case (avs_csr_address)
-                    3'd0: begin // CTRL
+                    3'd0: begin // CTRL: bit[0]=START, bit[1]=IRQ_EN, bit[2]=CLR_STICKY
                         if (avs_csr_byteenable[0])
                             irq_en <= avs_csr_writedata[1];
                     end
-                    3'd2: begin // DMA_BASE_ADDR
+                    3'd2: begin // DMA_BASE_ADDR (Byte address tren SDRAM)
                         if (avs_csr_byteenable[0]) dma_base_addr_reg[7:0]   <= avs_csr_writedata[7:0];
                         if (avs_csr_byteenable[1]) dma_base_addr_reg[15:8]  <= avs_csr_writedata[15:8];
                         if (avs_csr_byteenable[2]) dma_base_addr_reg[23:16] <= avs_csr_writedata[23:16];
                         if (avs_csr_byteenable[3]) dma_base_addr_reg[31:24] <= avs_csr_writedata[31:24];
                     end
-                    3'd3: begin // THRESHOLD
+                    3'd3: begin // THRESHOLD (Nguong FAST T: 0..255)
                         if (avs_csr_byteenable[0])
                             fast_thresh_reg <= avs_csr_writedata[7:0];
                     end
@@ -107,12 +126,15 @@ module fast_ip_wrapper #(
         end
     end
 
+    // ========================================================================
+    // Chot co trang thai Sticky & Tin hieu ngat IRQ
+    // ========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             done_sticky    <= 1'b0;
             err_sticky     <= 1'b0;
             pkt_ovf_sticky <= 1'b0;
-        end else if (start_cmd || clear_sticky) begin
+        end else if (start_edge || clear_sticky) begin
             done_sticky    <= 1'b0;
             err_sticky     <= 1'b0;
             pkt_ovf_sticky <= 1'b0;
@@ -125,6 +147,9 @@ module fast_ip_wrapper #(
 
     assign irq = irq_en && (done_sticky || err_sticky);
 
+    // ========================================================================
+    // Doc thanh ghi CSR (Read Latency = 1 chu ky clock)
+    // ========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             avs_csr_readdata <= 32'd0;
@@ -151,8 +176,10 @@ module fast_ip_wrapper #(
         end
     end
 
+    // ========================================================================
+    // Khoi loi FAST-9 Hardware Accelerator
+    // ========================================================================
     fast_top #(
-        .K_PER_CELL    (K_PER_CELL),
         .OUT_CNT_W     (OUT_CNT_W),
         .DRAIN_CYC     (DRAIN_CYC),
         .DMA_BURST_LEN (DMA_BURST_LEN)
